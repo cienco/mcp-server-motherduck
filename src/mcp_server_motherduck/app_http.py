@@ -2,7 +2,6 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from .server import run_query
 
-# MCP server (un solo tool: query)
 mcp = FastMCP("mcp-server-motherduck")
 
 @mcp.tool(name="query", description="Esegue una query parametrica su MotherDuck (DB my_db).")
