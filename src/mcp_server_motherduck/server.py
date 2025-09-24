@@ -8,25 +8,19 @@ from .configs import (
     QUERY_TIMEOUT_MS
 )
 
-# Comandi di sola lettura consentiti
+# Comandi di sola lettura
 READONLY_ALLOWED_PREFIX = ("SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN")
-# Comandi sempre vietati (DDL, etc.)
+# Sempre vietati (DDL/PRAGMA/…)
 BANNED_ALWAYS = (
     "CREATE","DROP","ALTER","TRUNCATE","ATTACH","DETACH",
     "COPY","PRAGMA","EXPORT","IMPORT","CALL","SET "
 )
 
 def _is_allowed(sql: str) -> bool:
-    """
-    Ritorna True se la query è permessa.
-    - SELECT/WITH/SHOW/DESCRIBE/EXPLAIN sempre ok
-    - INSERT/UPDATE/DELETE: solo se DEMO_RW=true e tabella whitelisted
-    - DDL/PRAGMA/…: sempre vietati
-    """
     s = sql.strip().upper()
     if any(b in s for b in BANNED_ALWAYS):
         return False
-    if s.startswith(("INSERT", "UPDATE", "DELETE")):
+    if s.startswith(("INSERT","UPDATE","DELETE")):
         if not DEMO_RW:
             return False
         sql_l = f" {sql.lower()} "
@@ -34,9 +28,6 @@ def _is_allowed(sql: str) -> bool:
     return s.startswith(READONLY_ALLOWED_PREFIX)
 
 def _ensure_limit_offset(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
-    """
-    Se mancano LIMIT/OFFSET, li aggiunge in coda e appende i valori ai params.
-    """
     has_limit = bool(re.search(r"\bLIMIT\s+\d+", sql, flags=re.I))
     has_offset = bool(re.search(r"\bOFFSET\s+\d+", sql, flags=re.I))
     new_sql = sql.rstrip().rstrip(";")
@@ -51,11 +42,10 @@ def _ensure_limit_offset(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
 
 def run_query(sql: str, params: List[Any] | None = None, timeout_ms: int = QUERY_TIMEOUT_MS):
     """
-    Esegue una query su MotherDuck.
-    - Verifica policy/whitelist
-    - Forza LIMIT/OFFSET sulle query di lettura
-    - Esegue in modo parametrico (mai string concat)
-    - Restituisce rows/columns/pagination o ok=True per mutazioni in demo
+    Esegue la query su MotherDuck con guard-rail:
+      - whitelist comandi
+      - LIMIT/OFFSET forzati sulle SELECT
+      - esecuzione parametrica (mai concat stringhe)
     """
     if not _is_allowed(sql):
         return {"error": "Query non permessa. Solo SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. Mutazioni solo in DEMO su tabelle whitelisted."}
@@ -70,23 +60,21 @@ def run_query(sql: str, params: List[Any] | None = None, timeout_ms: int = QUERY
         cur = con.cursor()
         cur.execute(sql, params)
 
-        # Mutazioni (INSERT/UPDATE/DELETE) → niente result set
+        # Mutazioni → nessun result set
         if not cur.description:
             elapsed_ms = int((time.time() - start) * 1000)
             return {"ok": True, "query_info": {"elapsed_ms": elapsed_ms}}
 
-        # Lettura → ritorna righe/colonne
+        # Lettura → righe/colonne
         rows = cur.fetchall()
         cols = [c[0] for c in cur.description] if cur.description else []
         elapsed_ms = int((time.time() - start) * 1000)
         out_rows = [dict(zip(cols, r)) for r in rows]
 
-        # best effort: leggi limit/offset dagli ultimi parametri se presenti
         def _to_int(x, default):
-            try:
-                return int(x)
-            except Exception:
-                return default
+            try: return int(x)
+            except Exception: return default
+
         limit = _to_int(params[-2], DEFAULT_LIMIT) if len(params) >= 2 else DEFAULT_LIMIT
         offset = _to_int(params[-1], DEFAULT_OFFSET) if len(params) >= 1 else DEFAULT_OFFSET
 
@@ -100,3 +88,7 @@ def run_query(sql: str, params: List[Any] | None = None, timeout_ms: int = QUERY
         return {"error": str(e)}
     finally:
         con.close()
+
+# shim di compatibilità (alcuni template importano build_application da qui)
+def build_application():
+    return None
