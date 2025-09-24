@@ -33,16 +33,29 @@ def _is_allowed(sql: str) -> bool:
     return s.startswith(READONLY_ALLOWED_PREFIX)
 
 
+# --- Supporto placeholder count (ignora '?' dentro apici) ---------------------
+def _placeholder_count(sql: str) -> int:
+    n = 0
+    in_s = False
+    esc = False
+    for ch in sql:
+        if in_s:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "'":
+                in_s = False
+        else:
+            if ch == "'":
+                in_s = True
+            elif ch == "?":
+                n += 1
+    return n
+
+
 # --- Normalizzazione params (compat con vari client MCP) ----------------------
 def _extract_scalar(v: Any) -> Any:
-    """
-    Estrae un valore scalare da formati comuni:
-    - {"type":"text","text":"M1"}  -> "M1"
-    - {"value": 100}               -> 100
-    - {"data": "..."} / {"text": "..."} -> ...
-    - dict con un solo campo       -> primo valore
-    - altrimenti stringify come fallback
-    """
     if isinstance(v, dict):
         for key in ("value", "data", "text"):
             if key in v:
@@ -53,7 +66,7 @@ def _extract_scalar(v: Any) -> Any:
     return v
 
 
-def _normalize_params(params: Any) -> List[Any]:
+def _normalize_params(params: Any, sql: str) -> List[Any]:
     """
     Accetta:
       - None
@@ -61,39 +74,46 @@ def _normalize_params(params: Any) -> List[Any]:
       - lista mista (scalari/dict)
       - dict (anche {"items":[...]})
       - stringa JSON ("[...]" o "{...}")
-    Ritorna sempre una LISTA di scalari.
+      - stringa semplice (es. "", "null", "M1")
+    Usa il conteggio dei placeholder nella SQL per evitare il bug "expected 0, got 1".
     """
     if params is None:
         return []
 
-    # 1) Se è stringa che sembra JSON, prova a decodificare
+    # stringhe: gestisci ""/null/JSON e il caso scalare guidato dai placeholder
     if isinstance(params, str):
         s = params.strip()
+        if s in ("", "null", "none", "undefined"):
+            return []
         if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
             try:
                 decoded = json.loads(s)
-                return _normalize_params(decoded)
+                return _normalize_params(decoded, sql)
             except Exception:
-                # non è JSON valido ⇒ trattalo come scalare singolo
-                return [params]
-        # stringa "semplice" ⇒ scalare
-        return [params]
+                # se non è JSON valido: decidi in base ai placeholder
+                pass
+        nph = _placeholder_count(sql)
+        if nph == 0:
+            return []          # nessun parametro atteso
+        if nph == 1:
+            return [s]         # un solo parametro: tratta la stringa come scalare
+        return []              # 2+ placeholder: non indovinare; aspetta array JSON
 
-    # 2) Scalare nativo
+    # scalari nativi
     if isinstance(params, (int, float, bool)):
         return [params]
 
-    # 3) Lista
+    # lista
     if isinstance(params, list):
         return [_extract_scalar(x) for x in params]
 
-    # 4) Dict
+    # dict
     if isinstance(params, dict):
         if "items" in params and isinstance(params["items"], list):
             return [_extract_scalar(x) for x in params["items"]]
         return [_extract_scalar(v) for v in params.values()]
 
-    # 5) Fallback
+    # fallback
     return [params]
 
 
@@ -119,7 +139,8 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
       - whitelist comandi
       - LIMIT/OFFSET forzati sulle SELECT
       - esecuzione parametrica (mai concatenare stringhe)
-      - normalizzazione 'params' da formati ricchi (o stringhe JSON) a lista di scalari
+      - normalizzazione 'params' da formati ricchi/stringhe → lista scalari,
+        evitando di passare 1 parametro quando i placeholder sono 0.
     """
     if not _is_allowed(sql):
         return {
@@ -129,7 +150,7 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
             )
         }
 
-    params = _normalize_params(params)
+    params = _normalize_params(params, sql)
 
     if sql.strip().upper().startswith(READONLY_ALLOWED_PREFIX):
         sql, params = _ensure_limit_offset(sql, params)
@@ -141,10 +162,7 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
         cur.execute(sql, params)
 
         if not cur.description:
-            return {
-                "ok": True,
-                "query_info": {"elapsed_ms": int((time.time() - start) * 1000)},
-            }
+            return {"ok": True, "query_info": {"elapsed_ms": int((time.time() - start) * 1000)}}
 
         rows = cur.fetchall()
         cols = [c[0] for c in cur.description] if cur.description else []
