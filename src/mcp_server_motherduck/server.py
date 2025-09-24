@@ -34,7 +34,7 @@ def _is_allowed(sql: str) -> bool:
         return any(f" {t.lower()} " in sql_l for t in RW_TABLE_WHITELIST)
     return s.startswith(READONLY_ALLOWED_PREFIX)
 
-# --- Placeholder utils (ignora '?' dentro apici) ------------------------------
+# --- Conta '?' ignorando quelli dentro apici ---------------------------------
 def _placeholder_count(sql: str) -> int:
     n = 0
     in_s = False
@@ -83,7 +83,7 @@ def _normalize_params(params: Any, sql: str) -> List[Any]:
                 return _normalize_params(decoded, sql)
             except Exception:
                 pass
-        # stringa semplice: decidi in base ai placeholder
+        # stringa semplice: decidi in base ai placeholder dell'ORIGINALE
         nph = _placeholder_count(sql)
         if nph == 0:
             return []
@@ -112,9 +112,9 @@ def _ensure_limit_offset(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
     """
     Regole:
     - SHOW/DESCRIBE: non toccare (niente LIMIT/OFFSET).
-    - Se NON ci sono placeholder nella SQL originale:
+    - Se l'ORIGINALE non ha placeholder:
         -> aggiungi LIMIT/OFFSET **letterali** (no parametri).
-    - Se ci sono già placeholder:
+    - Se l'ORIGINALE ha placeholder:
         -> aggiungi LIMIT ? OFFSET ? e appendi i valori ai params.
     """
     s_up = sql.strip().upper()
@@ -131,7 +131,7 @@ def _ensure_limit_offset(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
 
     nph_before = _placeholder_count(new_sql)
 
-    # Caso A: nessun placeholder -> letterali
+    # Caso A: nessun placeholder ORIGINALE -> letterali
     if nph_before == 0:
         if not has_limit:
             new_sql += f" LIMIT {min(DEFAULT_LIMIT, MAX_LIMIT)}"
@@ -139,7 +139,7 @@ def _ensure_limit_offset(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
             new_sql += f" OFFSET {DEFAULT_OFFSET}"
         return new_sql, new_params  # nessun parametro aggiunto
 
-    # Caso B: ci sono placeholder -> parametrici
+    # Caso B: ci sono placeholder nell'ORIGINALE -> parametrici
     if not has_limit:
         new_sql += " LIMIT ?"
         new_params.append(min(DEFAULT_LIMIT, MAX_LIMIT))
@@ -152,38 +152,36 @@ def _ensure_limit_offset(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
 # --- Entry point --------------------------------------------------------------
 def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) -> dict:
     """
-    Esegue query su MotherDuck con guard-rail:
-      - whitelist comandi
-      - paginazione sicura (vedi _ensure_limit_offset)
-      - esecuzione parametrica
-      - normalizzazione 'params' (evita mismatch 0 vs 1)
-      - se la SQL finale ha 0 placeholder, forza params_final = []
+    Esegue su MotherDuck con guard-rail:
+      - whitelist
+      - paginazione safe
+      - normalizzazione parametri
+      - ⚠️ se la SQL FINALE ha 0 placeholder, esegue SENZA params (niente seconda arg a DuckDB)
     """
     if not _is_allowed(sql):
         return {"error": "Query non permessa. Solo SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. Mutazioni solo in DEMO su tabelle whitelisted."}
 
-    # Normalizza rispetto alla SQL originale
     params_norm = _normalize_params(params, sql)
-
-    # Paginazione secondo regole
     sql_final, params_final = _ensure_limit_offset(sql, params_norm)
 
-    # Allineamento finale ai placeholder della SQL **finale**
     ph_after = _placeholder_count(sql_final)
 
-    # 🔒 Guardia assoluta: se la SQL finale non ha placeholder, NON passare parametri
-    if ph_after == 0:
-        params_final = []
-    else:
-        # Se #params > #placeholder, tronca
-        if len(params_final) > ph_after:
-            params_final = params_final[:ph_after]
+    # Guardia hard: se 0 placeholder nella SQL FINALE, esegui senza params del tutto
+    force_no_params = (ph_after == 0)
+
+    # Se #params > #placeholder, tronca
+    if not force_no_params and len(params_final) > ph_after:
+        params_final = params_final[:ph_after]
 
     start = time.time()
     con = connect()
     try:
         cur = con.cursor()
-        cur.execute(sql_final, params_final)
+
+        if force_no_params:
+            cur.execute(sql_final)  # <-- nessun secondo argomento
+        else:
+            cur.execute(sql_final, params_final)
 
         if not cur.description:
             result = {"ok": True, "query_info": {"elapsed_ms": int((time.time() - start) * 1000)}}
@@ -193,7 +191,7 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
                     "sql_final": sql_final,
                     "placeholders_final": ph_after,
                     "params_received": params,
-                    "params_final": params_final,
+                    "params_final": [] if force_no_params else params_final,
                 }
             return result
 
@@ -201,7 +199,7 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
         cols = [c[0] for c in cur.description] if cur.description else []
         out_rows = [dict(zip(cols, r)) for r in rows]
 
-        # deduci limit/offset usati (se letterali, usa default)
+        # deduci limit/offset (se letterali, usa default)
         def _to_int(x, default):
             try:
                 return int(x)
@@ -209,8 +207,7 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
                 return default
         limit = DEFAULT_LIMIT
         offset = DEFAULT_OFFSET
-        # Se abbiamo aggiunto placeholder per paginazione, prova a leggerli dagli ultimi due
-        if ph_after >= 2 and len(params_final) >= 2:
+        if not force_no_params and ph_after >= 2 and len(params_final) >= 2:
             limit = _to_int(params_final[-2], DEFAULT_LIMIT)
             offset = _to_int(params_final[-1], DEFAULT_OFFSET)
 
@@ -226,7 +223,7 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
                 "sql_final": sql_final,
                 "placeholders_final": ph_after,
                 "params_received": params,
-                "params_final": params_final,
+                "params_final": [] if force_no_params else params_final,
             }
         return result
     except Exception as e:
@@ -237,12 +234,12 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
                 "sql_final": sql_final,
                 "placeholders_final": ph_after,
                 "params_received": params,
-                "params_final": params_final,
+                "params_final": [] if force_no_params else params_final,
             }
         return err
     finally:
         con.close()
 
-# --- Shim di compatibilità ----------------------------------------------------
+# --- Shim compat --------------------------------------------------------------
 def build_application():
     return None
