@@ -1,38 +1,15 @@
-from typing import Any, Dict
+from typing import Any
 from mcp.server.fastmcp import FastMCP
 from .server import run_query
 
+# MCP server (un solo tool: query)
 mcp = FastMCP("mcp-server-motherduck")
 
-# Definizione esplicita dello schema: 'params' accetta array | string | object | null
-QUERY_INPUT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "sql": {"type": "string"},
-        "params": {
-            "oneOf": [
-                {"type": "array"},
-                {"type": "string"},
-                {"type": "object"},
-                {"type": "null"}
-            ]
-        },
-        "timeout_ms": {
-            "oneOf": [
-                {"type": "integer"},
-                {"type": "string"},
-                {"type": "null"}
-            ]
-        }
-    },
-    "required": ["sql"]
-}
-
-@mcp.tool(name="query", description="Esegue una query parametrica su MotherDuck (my_db).", input_schema=QUERY_INPUT_SCHEMA)
+@mcp.tool(name="query", description="Esegue una query parametrica su MotherDuck (DB my_db).")
 def query(sql: str, params: Any = None, timeout_ms: Any = None) -> dict:
     """
-    Tool MCP: accetta params come array, stringa JSON, oggetto o null.
-    La normalizzazione a lista di scalari è gestita in run_query().
+    'params' può essere lista/scalare/dict/stringa JSON/None.
+    La normalizzazione è gestita in run_query().
     """
     to_ms = 8000
     if timeout_ms is not None:
@@ -42,5 +19,5 @@ def query(sql: str, params: Any = None, timeout_ms: Any = None) -> dict:
             pass
     return run_query(sql, params, to_ms)
 
-# App ASGI MCP (Streamable HTTP) esposta su /mcp
+# Espone MCP via Streamable HTTP (endpoint: /mcp)
 application = mcp.streamable_http_app()
