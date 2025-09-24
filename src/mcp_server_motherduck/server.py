@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 from typing import Any, List, Tuple
@@ -12,6 +13,8 @@ from .configs import (
     DEFAULT_OFFSET,
     QUERY_TIMEOUT_MS,
 )
+
+DEBUG_MODE = os.getenv("DEBUG_MCP", "false").lower() == "true"
 
 # --- Policy comandi -----------------------------------------------------------
 READONLY_ALLOWED_PREFIX = ("SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN")
@@ -69,6 +72,7 @@ def _normalize_params(params: Any, sql: str) -> List[Any]:
     """
     if params is None:
         return []
+
     if isinstance(params, str):
         s = params.strip()
         if s in ("", "null", "none", "undefined"):
@@ -86,14 +90,18 @@ def _normalize_params(params: Any, sql: str) -> List[Any]:
         if nph == 1:
             return [s]
         return []
+
     if isinstance(params, (int, float, bool)):
         return [params]
+
     if isinstance(params, list):
         return [_extract_scalar(x) for x in params]
+
     if isinstance(params, dict):
         if "items" in params and isinstance(params["items"], list):
             return [_extract_scalar(x) for x in params["items"]]
         return [_extract_scalar(v) for v in params.values()]
+
     return [params]
 
 # --- Helpers SQL --------------------------------------------------------------
@@ -103,37 +111,35 @@ _OFFSET_RE = re.compile(r"\bOFFSET\s+\d+", flags=re.I)
 def _ensure_limit_offset(sql: str, params: List[Any]) -> Tuple[str, List[Any]]:
     """
     Regole:
-    - SHOW/DESCRIBE: non toccare (niente LIMIT/OFFSET aggiunti).
+    - SHOW/DESCRIBE: non toccare (niente LIMIT/OFFSET).
     - Se NON ci sono placeholder nella SQL originale:
         -> aggiungi LIMIT/OFFSET **letterali** (no parametri).
     - Se ci sono già placeholder:
         -> aggiungi LIMIT ? OFFSET ? e appendi i valori ai params.
-    In ogni caso, non duplicare LIMIT/OFFSET se già presenti.
     """
     s_up = sql.strip().upper()
     if s_up.startswith("SHOW") or s_up.startswith("DESCRIBE"):
-        return sql, params  # non aggiungere paginazione a SHOW/DESCRIBE
+        return sql, params  # nessuna modifica
 
     has_limit = bool(_LIMIT_RE.search(sql))
     has_offset = bool(_OFFSET_RE.search(sql))
     new_sql = sql.rstrip().rstrip(";")
     new_params = list(params)
 
-    # niente da fare se già presenti entrambi
     if has_limit and has_offset:
         return new_sql, new_params
 
     nph_before = _placeholder_count(new_sql)
 
-    # Caso A: nessun placeholder nella SQL -> aggiungi letterali
+    # Caso A: nessun placeholder -> letterali
     if nph_before == 0:
         if not has_limit:
             new_sql += f" LIMIT {min(DEFAULT_LIMIT, MAX_LIMIT)}"
         if not has_offset:
             new_sql += f" OFFSET {DEFAULT_OFFSET}"
-        return new_sql, new_params  # NON aggiungere parametri
+        return new_sql, new_params  # nessun parametro aggiunto
 
-    # Caso B: ci sono placeholder -> usa parametri per lim/offset mancanti
+    # Caso B: ci sono placeholder -> parametrici
     if not has_limit:
         new_sql += " LIMIT ?"
         new_params.append(min(DEFAULT_LIMIT, MAX_LIMIT))
@@ -150,23 +156,28 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
       - whitelist comandi
       - paginazione sicura (vedi _ensure_limit_offset)
       - esecuzione parametrica
-      - normalizzazione 'params' (ed evita mismatch 0 vs 1)
+      - normalizzazione 'params' (evita mismatch 0 vs 1)
+      - se la SQL finale ha 0 placeholder, forza params_final = []
     """
     if not _is_allowed(sql):
         return {"error": "Query non permessa. Solo SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. Mutazioni solo in DEMO su tabelle whitelisted."}
 
-    # Normalizza in base alla SQL originale (serve per gestire il caso 0 placeholder)
+    # Normalizza rispetto alla SQL originale
     params_norm = _normalize_params(params, sql)
 
-    # Aggiungi paginazione secondo le regole
+    # Paginazione secondo regole
     sql_final, params_final = _ensure_limit_offset(sql, params_norm)
 
-    # Allineamento finale: se #params > #placeholder, tronca gli extra
+    # Allineamento finale ai placeholder della SQL **finale**
     ph_after = _placeholder_count(sql_final)
-    if len(params_final) > ph_after:
-        params_final = params_final[:ph_after]
-    # Se #params < #placeholder (dovrebbe accadere solo per i due extra che aggiungiamo noi),
-    # non forziamo a riempire: _ensure_limit_offset si occupa di appendere i suoi se servono.
+
+    # 🔒 Guardia assoluta: se la SQL finale non ha placeholder, NON passare parametri
+    if ph_after == 0:
+        params_final = []
+    else:
+        # Se #params > #placeholder, tronca
+        if len(params_final) > ph_after:
+            params_final = params_final[:ph_after]
 
     start = time.time()
     con = connect()
@@ -175,7 +186,16 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
         cur.execute(sql_final, params_final)
 
         if not cur.description:
-            return {"ok": True, "query_info": {"elapsed_ms": int((time.time() - start) * 1000)}}
+            result = {"ok": True, "query_info": {"elapsed_ms": int((time.time() - start) * 1000)}}
+            if DEBUG_MODE:
+                result["debug"] = {
+                    "sql_original": sql,
+                    "sql_final": sql_final,
+                    "placeholders_final": ph_after,
+                    "params_received": params,
+                    "params_final": params_final,
+                }
+            return result
 
         rows = cur.fetchall()
         cols = [c[0] for c in cur.description] if cur.description else []
@@ -187,21 +207,39 @@ def run_query(sql: str, params: Any = None, timeout_ms: int = QUERY_TIMEOUT_MS) 
                 return int(x)
             except Exception:
                 return default
-        # Proviamo a leggere dagli ultimi due parametri solo se corrispondono a placeholder aggiunti
         limit = DEFAULT_LIMIT
         offset = DEFAULT_OFFSET
+        # Se abbiamo aggiunto placeholder per paginazione, prova a leggerli dagli ultimi due
         if ph_after >= 2 and len(params_final) >= 2:
             limit = _to_int(params_final[-2], DEFAULT_LIMIT)
             offset = _to_int(params_final[-1], DEFAULT_OFFSET)
 
-        return {
+        result = {
             "columns": cols,
             "rows": out_rows,
             "pagination": {"limit": limit, "offset": offset, "next_offset": offset + len(out_rows)},
             "query_info": {"elapsed_ms": int((time.time() - start) * 1000)},
         }
+        if DEBUG_MODE:
+            result["debug"] = {
+                "sql_original": sql,
+                "sql_final": sql_final,
+                "placeholders_final": ph_after,
+                "params_received": params,
+                "params_final": params_final,
+            }
+        return result
     except Exception as e:
-        return {"error": str(e)}
+        err = {"error": str(e)}
+        if DEBUG_MODE:
+            err["debug"] = {
+                "sql_original": sql,
+                "sql_final": sql_final,
+                "placeholders_final": ph_after,
+                "params_received": params,
+                "params_final": params_final,
+            }
+        return err
     finally:
         con.close()
 
