@@ -1,4 +1,3 @@
-# src/mcp_server_motherduck/app_http.py
 from fastapi import FastAPI
 from pydantic import BaseModel
 from .server import run_query
@@ -16,4 +15,4 @@ def health():
 
 @app.post("/query")
 def query(payload: QueryPayload):
-    return run_query(payload.sql, payload.params, payload.timeout_ms)
+    return run_query(payload.sql, payload.params, payload.timeout_ms or 8000)
