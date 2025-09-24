@@ -12,7 +12,9 @@ dependencies = [
  "uvicorn>=0.34.0",
  "anyio>=4.8.0",
  "mcp>=1.9.4",
- "pytz>=2025.2"
+ "pytz>=2025.2",
+ "fastapi>=0.111.0",
+ "uvicorn[standard]>=0.30.0"
 ]
 
 [[project.authors]]
